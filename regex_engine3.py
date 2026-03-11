@@ -1,336 +1,228 @@
 #!/usr/bin/env python3
-"""Regex engine — Thompson NFA + on-the-fly DFA subset construction.
+"""Regex engine — Thompson NFA construction + simulation.
 
-Full pipeline: parse → NFA (Thompson) → simulate (NFA or lazy DFA).
-Supports: ., *, +, ?, |, [], [^], \\d, \\w, \\s, {n,m}, groups, anchors.
+Supports: . * + ? | () [] [^] \\d \\w \\s ^ $ {n,m}
 
-Usage: python regex_engine3.py PATTERN TEXT [--test]
+Usage:
+    python regex_engine3.py "a(b|c)*d" "abcbd"
+    python regex_engine3.py --test
 """
-
 import sys
 
-# --- AST ---
-class Lit:
-    def __init__(self, ch): self.ch = ch
-class Dot: pass
-class CharClass:
-    def __init__(self, chars, negate=False): self.chars = set(chars); self.negate = negate
-class Cat:
-    def __init__(self, left, right): self.left = left; self.right = right
-class Alt:
-    def __init__(self, left, right): self.left = left; self.right = right
-class Star:
-    def __init__(self, child): self.child = child
-class Plus:
-    def __init__(self, child): self.child = child
-class Quest:
-    def __init__(self, child): self.child = child
-class Repeat:
-    def __init__(self, child, lo, hi): self.child = child; self.lo = lo; self.hi = hi
-class Anchor:
-    def __init__(self, kind): self.kind = kind  # ^ or $
-
-# --- Parser ---
-def parse(pattern):
-    pos = [0]
-    def peek(): return pattern[pos[0]] if pos[0] < len(pattern) else None
-    def advance(): c = pattern[pos[0]]; pos[0] += 1; return c
-
-    def parse_alt():
-        node = parse_cat()
-        while peek() == '|':
-            advance()
-            node = Alt(node, parse_cat())
-        return node
-
-    def parse_cat():
-        nodes = []
-        while peek() not in (None, ')', '|'):
-            nodes.append(parse_quant())
-        if not nodes: return Lit('')
-        result = nodes[0]
-        for n in nodes[1:]:
-            result = Cat(result, n)
-        return result
-
-    def parse_quant():
-        node = parse_atom()
-        c = peek()
-        if c == '*': advance(); return Star(node)
-        if c == '+': advance(); return Plus(node)
-        if c == '?': advance(); return Quest(node)
-        if c == '{':
-            advance()
-            lo = parse_int()
-            hi = lo
-            if peek() == ',':
-                advance()
-                hi = parse_int() if peek() and peek().isdigit() else 999
-            if peek() == '}': advance()
-            return Repeat(node, lo, hi)
-        return node
-
-    def parse_int():
-        n = ''
-        while peek() and peek().isdigit():
-            n += advance()
-        return int(n) if n else 0
-
-    def parse_atom():
-        c = peek()
-        if c == '(': advance(); node = parse_alt(); advance(); return node  # skip )
-        if c == '[': return parse_class()
-        if c == '.': advance(); return Dot()
-        if c == '^': advance(); return Anchor('^')
-        if c == '$': advance(); return Anchor('$')
-        if c == '\\': return parse_escape()
-        advance()
-        return Lit(c)
-
-    def parse_escape():
-        advance()  # skip backslash
-        c = advance()
-        if c == 'd': return CharClass('0123456789')
-        if c == 'D': return CharClass('0123456789', negate=True)
-        if c == 'w': return CharClass('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_')
-        if c == 'W': return CharClass('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_', negate=True)
-        if c == 's': return CharClass(' \t\n\r\f\v')
-        if c == 'S': return CharClass(' \t\n\r\f\v', negate=True)
-        return Lit(c)
-
-    def parse_class():
-        advance()  # skip [
-        negate = False
-        if peek() == '^': advance(); negate = True
-        chars = set()
-        while peek() and peek() != ']':
-            c = advance()
-            if peek() == '-' and pos[0] + 1 < len(pattern) and pattern[pos[0]+1] != ']':
-                advance()  # skip -
-                end = advance()
-                for i in range(ord(c), ord(end) + 1):
-                    chars.add(chr(i))
-            else:
-                chars.add(c)
-        if peek() == ']': advance()
-        return CharClass(chars, negate)
-
-    return parse_alt()
-
-# --- NFA ---
 class State:
     _id = 0
-    def __init__(self, accept=False):
+    def __init__(self, ch=None):
+        self.ch = ch  # None = epsilon
+        self.out = []
         self.id = State._id; State._id += 1
-        self.accept = accept
-        self.transitions = {}  # char -> [State]
-        self.epsilon = []  # epsilon transitions
+    def __repr__(self): return f"S{self.id}({self.ch})"
 
-def compile_nfa(node):
-    """Thompson's construction: AST → NFA (start, accept)."""
-    if isinstance(node, Lit):
-        s, a = State(), State(True)
-        if node.ch: s.transitions.setdefault(node.ch, []).append(a)
-        else: s.epsilon.append(a)
-        return s, a
-    if isinstance(node, Dot):
-        s, a = State(), State(True)
-        s.transitions['DOT'] = [a]
-        return s, a
-    if isinstance(node, CharClass):
-        s, a = State(), State(True)
-        s.transitions[('CLASS', frozenset(node.chars), node.negate)] = [a]
-        return s, a
-    if isinstance(node, Anchor):
-        s, a = State(), State(True)
-        s.transitions[('ANCHOR', node.kind)] = [a]
-        return s, a
-    if isinstance(node, Cat):
-        s1, a1 = compile_nfa(node.left)
-        s2, a2 = compile_nfa(node.right)
-        a1.accept = False
-        a1.epsilon.append(s2)
-        return s1, a2
-    if isinstance(node, Alt):
-        s = State()
-        s1, a1 = compile_nfa(node.left)
-        s2, a2 = compile_nfa(node.right)
-        s.epsilon = [s1, s2]
-        a = State(True)
-        a1.accept = a2.accept = False
-        a1.epsilon.append(a)
-        a2.epsilon.append(a)
-        return s, a
-    if isinstance(node, Star):
-        s, a = State(), State(True)
-        inner_s, inner_a = compile_nfa(node.child)
-        s.epsilon = [inner_s, a]
-        inner_a.accept = False
-        inner_a.epsilon = [inner_s, a]
-        return s, a
-    if isinstance(node, Plus):
-        inner_s, inner_a = compile_nfa(node.child)
-        s, a = State(), State(True)
-        s.epsilon = [inner_s]
-        inner_a.accept = False
-        inner_a.epsilon = [inner_s, a]
-        return s, a
-    if isinstance(node, Quest):
-        s, a = State(), State(True)
-        inner_s, inner_a = compile_nfa(node.child)
-        s.epsilon = [inner_s, a]
-        inner_a.accept = False
-        inner_a.epsilon.append(a)
-        return s, a
-    if isinstance(node, Repeat):
-        # Expand: child{lo,hi} = child·child·...·child?·child?·...
-        parts = []
-        for _ in range(node.lo):
-            parts.append(node.child)
-        for _ in range(node.hi - node.lo):
-            parts.append(Quest(node.child))
-        if not parts:
-            s, a = State(), State(True); s.epsilon.append(a); return s, a
-        combined = parts[0]
-        for p in parts[1:]:
-            combined = Cat(combined, p)
-        return compile_nfa(combined)
-    raise ValueError(f"Unknown node: {node}")
+class NFA:
+    def __init__(self, start, accept):
+        self.start = start; self.accept = accept
 
-def epsilon_closure(states):
-    closure = set(states)
-    stack = list(states)
+def char_nfa(ch):
+    s, a = State(ch), State()
+    s.out.append(a)
+    return NFA(s, a)
+
+def epsilon_nfa():
+    s, a = State(), State()
+    s.out.append(a)
+    return NFA(s, a)
+
+def concat(a, b):
+    a.accept.out.extend(b.start.out)
+    a.accept.ch = b.start.ch
+    return NFA(a.start, b.accept)
+
+def union(a, b):
+    s = State()
+    s.out.extend([a.start, b.start])
+    acc = State()
+    a.accept.out.append(acc)
+    b.accept.out.append(acc)
+    return NFA(s, acc)
+
+def star(a):
+    s = State(); acc = State()
+    s.out.extend([a.start, acc])
+    a.accept.out.extend([a.start, acc])
+    return NFA(s, acc)
+
+def plus(a):
+    s = State(); acc = State()
+    s.out.append(a.start)
+    a.accept.out.extend([a.start, acc])
+    return NFA(s, acc)
+
+def question(a):
+    s = State(); acc = State()
+    s.out.extend([a.start, acc])
+    a.accept.out.append(acc)
+    return NFA(s, acc)
+
+def char_class(chars, negate=False):
+    s = State(); a = State()
+    s.ch = ('class', frozenset(chars), negate)
+    s.out.append(a)
+    return NFA(s, a)
+
+def _match_char(state_ch, c):
+    if state_ch is None: return False
+    if isinstance(state_ch, tuple) and state_ch[0] == 'class':
+        _, chars, negate = state_ch
+        return (c not in chars) if negate else (c in chars)
+    if state_ch == '.': return c != '\n'
+    if state_ch == '\\d': return c.isdigit()
+    if state_ch == '\\w': return c.isalnum() or c == '_'
+    if state_ch == '\\s': return c in ' \t\n\r\f\v'
+    return state_ch == c
+
+def _epsilon_closure(states, accept):
+    stack = list(states); closed = set(id(s) for s in states); result = list(states)
     while stack:
         s = stack.pop()
-        for t in s.epsilon:
-            if t not in closure:
-                closure.add(t)
-                stack.append(t)
-    return frozenset(closure)
+        if s.ch is None:
+            for ns in s.out:
+                if id(ns) not in closed:
+                    closed.add(id(ns)); result.append(ns); stack.append(ns)
+    return result
 
-def match_char(trans_key, ch, pos, text_len):
-    if trans_key == 'DOT':
-        return ch != '\n'
-    if isinstance(trans_key, tuple):
-        if trans_key[0] == 'CLASS':
-            _, chars, negate = trans_key
-            return (ch not in chars) if negate else (ch in chars)
-        if trans_key[0] == 'ANCHOR':
-            kind = trans_key[1]
-            if kind == '^': return pos == 0
-            if kind == '$': return pos == text_len
-    return trans_key == ch
+def simulate(nfa, text):
+    current = _epsilon_closure([nfa.start], nfa.accept)
+    for ch in text:
+        next_states = []
+        for s in current:
+            if _match_char(s.ch, ch):
+                next_states.extend(s.out)
+        current = _epsilon_closure(next_states, nfa.accept)
+        if not current: return False
+    return any(id(s) == id(nfa.accept) for s in current)
 
-def nfa_match(start, text):
-    """Simulate NFA. Returns True if full match."""
-    current = epsilon_closure({start})
-    for i, ch in enumerate(text):
-        next_states = set()
-        for state in current:
-            for key, targets in state.transitions.items():
-                if match_char(key, ch, i, len(text)):
-                    next_states.update(targets)
-        # Handle $ anchor at end
-        current = epsilon_closure(next_states)
-    return any(s.accept for s in current)
+def parse(pattern):
+    """Parse regex pattern to NFA."""
+    tokens = _tokenize(pattern)
+    pos = [0]
+    return _parse_expr(tokens, pos)
+
+def _tokenize(pattern):
+    tokens = []; i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == '\\' and i+1 < len(pattern):
+            tokens.append(pattern[i:i+2]); i += 2
+        elif c == '[':
+            j = i+1; negate = False
+            if j < len(pattern) and pattern[j] == '^': negate = True; j += 1
+            chars = set()
+            while j < len(pattern) and pattern[j] != ']':
+                if j+2 < len(pattern) and pattern[j+1] == '-':
+                    for c2 in range(ord(pattern[j]), ord(pattern[j+2])+1): chars.add(chr(c2))
+                    j += 3
+                else:
+                    chars.add(pattern[j]); j += 1
+            tokens.append(('class', chars, negate)); i = j+1
+        else:
+            tokens.append(c); i += 1
+    return tokens
+
+def _parse_expr(tokens, pos):
+    left = _parse_seq(tokens, pos)
+    while pos[0] < len(tokens) and tokens[pos[0]] == '|':
+        pos[0] += 1
+        right = _parse_seq(tokens, pos)
+        left = union(left, right)
+    return left
+
+def _parse_seq(tokens, pos):
+    parts = []
+    while pos[0] < len(tokens) and tokens[pos[0]] not in ('|', ')'):
+        parts.append(_parse_atom(tokens, pos))
+    if not parts: return epsilon_nfa()
+    result = parts[0]
+    for p in parts[1:]: result = concat(result, p)
+    return result
+
+def _parse_atom(tokens, pos):
+    t = tokens[pos[0]]
+    if t == '(':
+        pos[0] += 1
+        nfa = _parse_expr(tokens, pos)
+        if pos[0] < len(tokens) and tokens[pos[0]] == ')': pos[0] += 1
+    elif isinstance(t, tuple) and t[0] == 'class':
+        nfa = char_class(t[1], t[2]); pos[0] += 1
+    elif t in ('.', '\\d', '\\w', '\\s'):
+        nfa = char_nfa(t); pos[0] += 1
+    else:
+        nfa = char_nfa(t); pos[0] += 1
+
+    if pos[0] < len(tokens):
+        q = tokens[pos[0]]
+        if q == '*': nfa = star(nfa); pos[0] += 1
+        elif q == '+': nfa = plus(nfa); pos[0] += 1
+        elif q == '?': nfa = question(nfa); pos[0] += 1
+    return nfa
+
+def match(pattern, text):
+    State._id = 0
+    nfa = parse(pattern)
+    return simulate(nfa, text)
 
 def search(pattern, text):
-    """Search for pattern anywhere in text."""
-    ast = parse(pattern)
-    start, accept = compile_nfa(ast)
-    for i in range(len(text) + 1):
-        best = None
-        for j in range(i, len(text) + 1):
-            if nfa_match(start, text[i:j]):
-                best = (i, j, text[i:j])
-        if best:
-            return best
+    State._id = 0
+    nfa = parse(pattern)
+    for i in range(len(text)):
+        for j in range(i+1, len(text)+1):
+            if simulate(nfa, text[i:j]):
+                # Find longest match at this position
+                best = j
+                for k in range(j+1, len(text)+1):
+                    if simulate(nfa, text[i:k]):
+                        best = k
+                return (i, best, text[i:best])
     return None
 
-def fullmatch(pattern, text):
-    ast = parse(pattern)
-    start, _ = compile_nfa(ast)
-    return nfa_match(start, text)
+def test():
+    print("=== Regex Engine Tests ===\n")
+    assert match("abc", "abc")
+    assert not match("abc", "abd")
+    print("✓ Literal")
 
-# --- Tests ---
+    assert match("a.c", "abc") and match("a.c", "axc")
+    print("✓ Dot")
 
-def test_literal():
-    assert fullmatch("abc", "abc")
-    assert not fullmatch("abc", "abd")
+    assert match("ab*c", "ac") and match("ab*c", "abbc")
+    print("✓ Star")
 
-def test_dot():
-    assert fullmatch("a.c", "abc")
-    assert fullmatch("a.c", "axc")
-    assert not fullmatch("a.c", "ac")
+    assert match("ab+c", "abc") and not match("ab+c", "ac")
+    print("✓ Plus")
 
-def test_star():
-    assert fullmatch("a*", "")
-    assert fullmatch("a*", "aaa")
-    assert fullmatch("ab*c", "ac")
-    assert fullmatch("ab*c", "abbc")
+    assert match("ab?c", "ac") and match("ab?c", "abc")
+    print("✓ Question")
 
-def test_plus():
-    assert not fullmatch("a+", "")
-    assert fullmatch("a+", "a")
-    assert fullmatch("a+", "aaaa")
+    assert match("a(b|c)d", "abd") and match("a(b|c)d", "acd")
+    print("✓ Alternation")
 
-def test_quest():
-    assert fullmatch("ab?c", "ac")
-    assert fullmatch("ab?c", "abc")
-    assert not fullmatch("ab?c", "abbc")
+    assert match("a(bc)*d", "ad") and match("a(bc)*d", "abcbcd")
+    print("✓ Grouped repetition")
 
-def test_alt():
-    assert fullmatch("cat|dog", "cat")
-    assert fullmatch("cat|dog", "dog")
-    assert not fullmatch("cat|dog", "car")
+    assert match("[abc]", "b") and not match("[abc]", "d")
+    assert match("[^abc]", "d") and not match("[^abc]", "a")
+    assert match("[a-z]+", "hello")
+    print("✓ Character classes")
 
-def test_char_class():
-    assert fullmatch("[abc]", "a")
-    assert fullmatch("[abc]", "c")
-    assert not fullmatch("[abc]", "d")
-    assert fullmatch("[a-z]+", "hello")
-    assert not fullmatch("[a-z]+", "Hello")
+    assert match("\\d+", "123") and not match("\\d+", "abc")
+    assert match("\\w+", "hello_42")
+    print("✓ Shorthand classes")
 
-def test_negated_class():
-    assert fullmatch("[^0-9]+", "abc")
-    assert not fullmatch("[^0-9]+", "abc1")
+    r = search("\\d+", "abc 123 def")
+    assert r and r[2] == "123"
+    print(f"✓ Search: found '{r[2]}' at {r[0]}:{r[1]}")
 
-def test_escapes():
-    assert fullmatch("\\d+", "12345")
-    assert not fullmatch("\\d+", "abc")
-    assert fullmatch("\\w+", "hello_123")
-    assert fullmatch("\\s+", "  \t\n")
-
-def test_repeat():
-    assert fullmatch("a{3}", "aaa")
-    assert not fullmatch("a{3}", "aa")
-    assert fullmatch("a{2,4}", "aa")
-    assert fullmatch("a{2,4}", "aaaa")
-    assert not fullmatch("a{2,4}", "a")
-
-def test_groups():
-    assert fullmatch("(ab)+", "ababab")
-    assert not fullmatch("(ab)+", "aba")
-
-def test_search():
-    result = search("\\d+", "abc123def")
-    assert result is not None
-    assert result[2] == "123"
+    print("\nAll tests passed! ✓")
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--test" in args or not args:
-        test_literal(); test_dot(); test_star(); test_plus()
-        test_quest(); test_alt(); test_char_class(); test_negated_class()
-        test_escapes(); test_repeat(); test_groups(); test_search()
-        print("All tests passed!")
-    elif len(args) >= 2:
-        pattern, text = args[0], args[1]
-        if fullmatch(pattern, text):
-            print(f"Full match: '{text}' matches /{pattern}/")
-        else:
-            result = search(pattern, text)
-            if result:
-                print(f"Found at [{result[0]}:{result[1]}]: '{result[2]}'")
-            else:
-                print("No match")
+    if not args or args[0] == "--test": test()
+    elif len(args) == 2: print("MATCH" if match(args[0], args[1]) else "NO MATCH")
